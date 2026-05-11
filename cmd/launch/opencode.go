@@ -242,27 +242,29 @@ func readModelJSONModels() []string {
 }
 
 func buildModelEntries(ctx context.Context, client *api.Client, modelList []string) map[string]any {
-	if client != nil {
-		var cancel context.CancelFunc
-		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-			ctx, cancel = context.WithTimeout(ctx, openCodeModelShowTimeout)
-			defer cancel()
-		}
-	}
-
 	models := make(map[string]any)
 	for _, modelID := range modelList {
 		entry := map[string]any{
 			"name": modelID,
 		}
 		if client != nil {
-			if resp, err := client.Show(ctx, &api.ShowRequest{Model: modelID}); err == nil {
+			showCtx := ctx
+			var cancel context.CancelFunc
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				showCtx, cancel = context.WithTimeout(ctx, openCodeModelShowTimeout)
+			}
+
+			if resp, err := client.Show(showCtx, &api.ShowRequest{Model: modelID}); err == nil {
 				if slices.Contains(resp.Capabilities, model.CapabilityVision) {
 					entry["modalities"] = map[string]any{
 						"input":  []string{"text", "image"},
 						"output": []string{"text"},
 					}
 				}
+				applyOpenCodeReasoning(resp, modelID, entry)
+			}
+			if cancel != nil {
+				cancel()
 			}
 		}
 		if isCloudModelName(modelID) {
@@ -273,7 +275,6 @@ func buildModelEntries(ctx context.Context, client *api.Client, modelList []stri
 				}
 			}
 		}
-		applyOpenCodeReasoning(ctx, client, modelID, entry)
 		models[modelID] = entry
 	}
 	return models
@@ -288,20 +289,15 @@ func buildModelEntries(ctx context.Context, client *api.Client, modelList []stri
 //     and adds a "none" variant so users can toggle thinking off via Ctrl+T.
 //
 // When the model does not support thinking, no reasoning config is set.
-func applyOpenCodeReasoning(ctx context.Context, client *api.Client, modelName string, entry map[string]any) {
-	if client == nil {
-		return
-	}
-
-	resp, err := client.Show(ctx, &api.ShowRequest{Model: modelName})
-	if err != nil {
+func applyOpenCodeReasoning(resp *api.ShowResponse, modelName string, entry map[string]any) {
+	if resp == nil {
 		return
 	}
 
 	if slices.Contains(resp.Capabilities, model.CapabilityThinking) {
 		entry["reasoning"] = true
 
-		if strings.Contains(modelName, "gpt-oss") {
+		if openCodeSupportsReasoningLevels(resp, modelName) {
 			// GPT-OSS models support variable thinking effort levels
 			// and cannot turn thinking off. Keep the built-in
 			// low/medium/high variants as-is and default to medium.
@@ -322,4 +318,21 @@ func applyOpenCodeReasoning(ctx context.Context, client *api.Client, modelName s
 			}
 		}
 	}
+}
+
+func openCodeSupportsReasoningLevels(resp *api.ShowResponse, modelName string) bool {
+	if resp != nil {
+		families := append([]string{resp.Details.Family}, resp.Details.Families...)
+		if arch, ok := resp.ModelInfo["general.architecture"].(string); ok {
+			families = append(families, arch)
+		}
+		for _, family := range families {
+			if family == "gptoss" || family == "gpt-oss" {
+				return true
+			}
+		}
+	}
+
+	// Fallback for older servers or sparse test responses that do not include family data.
+	return strings.Contains(modelName, "gpt-oss")
 }
